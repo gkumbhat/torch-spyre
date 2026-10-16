@@ -370,18 +370,6 @@ def _autoload_impl():
         _orig_init = torch.profiler.profile.__init__
 
         def _init_with_spyre_profiler(self, *args, **kwargs):
-            # Loading _C is all that is needed to register the Spyre profiler:
-            # the PrivateUse1 activity profiler is installed by the static
-            # REGISTER_PRIVATEUSE1_PROFILER initializer in
-            # csrc/profiler/SpyreActivityProfiler.cpp, which runs at .so load
-            # time and does not touch the device runtime.
-            #
-            # Deliberately does NOT start the runtime. profile() is constructed
-            # in processes that have no device role -- e.g. the vLLM API-server
-            # front-end, which traces CPU activity only -- and opening the card
-            # there fails once the process that owns it has it. Real device work
-            # self-triggers startRuntime() via std::call_once, so PrivateUse1
-            # tracing is unaffected.
             try:
                 import torch_spyre._C  # noqa: F401
             except ImportError:
