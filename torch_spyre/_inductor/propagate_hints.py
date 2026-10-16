@@ -34,26 +34,36 @@ logger = get_inductor_logger("propagate_hints")
 @dataclasses.dataclass
 class DimHint:
     dim_names: list[str]  # e.g. ["A"]
-    split_count: int  # from slices={"A": 4}, e.g. 4
+    split_count: int  # tile count; 1 for a for_each_tile level (see loop_var_range)
     loop_var: "sympy.Symbol | None"  # the loop variable (e.g. c0, c1) for this dim;
     # None when op is broadcast w.r.t. this hint scope
     is_reduction: bool
     hint_id: int = 0  # the _hint_N counter value identifying the scope
+    loop_var_range: "sympy.Expr | int | None" = None
+    # Valid range (trip count) of loop_var, when loop_var is an unbacked
+    # scalar symbol that is NOT a key of any MemoryDep.ranges (e.g. the
+    # WhileLoop-splice per-iteration symbol synthesized by
+    # for_each_tile_lowering.py's _synthesize_dim_hints_for_group). Ordinary
+    # spyre_hint()-scope loop vars are real Inductor iteration-range
+    # variables already present in dep.ranges, so this stays None for them
+    # -- host_coordinates/compute_coordinates already know their range.
+    # op_out_coords uses this to give the WhileLoop symbol a real coordinate
+    # term instead of silently dropping it (see coarse_tile.py's
+    # _loop_var_to_ranges_pos, which requires the symbol to actually appear
+    # in the op's output coordinates).
 
 
 # op.dim_hints: list[DimHint]
 #
-# One entry per hinted dimension, ordered outermost hint scope first.
-# Outer hint IDs are smaller than inner hint IDs (guaranteed by spyre_hint
-# counter order), so sorting by hint ID gives outermost-first ordering.
+# One entry per tiled dimension, ordered outermost loop level first.  Built by
+# for_each_tile's lowering (one per nesting level, with loop_var_range set) and
+# by the span-overflow planner.  Sorting by hint ID gives outermost-first
+# ordering.
 #
-# Example — two nested hints on one op:
-#   with spyre_hint(slices={"A": 2}):      # outer scope → smaller hint ID
-#       with spyre_hint(slices={"B": 4}):  # inner scope → larger hint ID
-#           y = a + b
+# Example — a two-level span-overflow tiling of one op:
 #
 # dim_hints = [DimHint(dim_names=["A"], split_count=2, loop_var=c0, ...),
-#                 DimHint(dim_names=["B"], split_count=4, loop_var=c1, ...)]
+#              DimHint(dim_names=["B"], split_count=4, loop_var=c1, ...)]
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
@@ -82,10 +92,38 @@ def get_id():
     return counter, torch.empty(0, device="cpu")
 
 
+# The keys a spyre_hint scope can carry.  Tiling is expressed with for_each_tile,
+# so the former tiling keys are rejected rather than silently ignored: an old
+# annotation would otherwise compile to an untiled graph with no signal.
+_VALID_HINT_KEYS = frozenset(
+    {"work_div", "named_dims", "expected_named_dims", "expected_reduction_dims"}
+)
+_REMOVED_TILING_KEYS = frozenset({"num_tiles_per_dim", "tiles", "slices"})
+
+
+def _validate_hint_keys(kwargs: dict[str, Any]) -> None:
+    for key in kwargs:
+        if key in _REMOVED_TILING_KEYS:
+            raise ValueError(
+                f"spyre_hint({key}=...) has been removed; express tiled loops with "
+                f"for_each_tile (torch_spyre._inductor.wsr.for_each_tile) instead"
+            )
+        if key not in _VALID_HINT_KEYS:
+            raise ValueError(
+                f"spyre_hint() got an unrecognized key {key!r}; accepted keys: "
+                f"{sorted(_VALID_HINT_KEYS)}"
+            )
+
+
 def spyre_hint(**kwargs: Any):
     """
     Attach a hint and a unique hint id to every FX node in scope.
+
+    Accepted keys: ``work_div`` (per-dimension core split), ``named_dims`` (dimension
+    names for the ops in scope) and the assertions ``expected_named_dims`` /
+    ``expected_reduction_dims``.  Anything else raises ``ValueError``.
     """
+    _validate_hint_keys(kwargs)
     if torch.compiler.is_compiling():
         _id, _ = get_id()
     else:
@@ -119,13 +157,19 @@ def log_new_nodes(node: torch.fx.Node):
         node.graph.owning_module is not None
         and (meta := node.graph.owning_module.meta.get(OBSERVER_HOOKS_KEY)) is not None
     ):
-        _pass = meta["pass"]
-        subsystem = meta["subsystem"]
+        # `meta["pass"]`/`meta["subsystem"]` are only present while an
+        # `apply_graph_pass` call is in flight (patches.py pops them in its
+        # `finally`); the dict itself is never removed from gm.meta, so a
+        # node created outside that window -- e.g. by an `apply_gm_pass`
+        # call such as `decompose_scan_to_while_loop`, which never sets
+        # these keys at all -- must not KeyError here.
+        _pass = meta.get("pass", "unknown")
+        subsystem = meta.get("subsystem", "unknown")
     else:
         _pass = "unknown"
         subsystem = "unknown"
 
-    logger.warning(
+    logger.debug(
         "Post-grad insertion of node %s with target %s detected after"
         " pass %s, subsystem %s. Spyre hints could be invalidated.",
         node.name,
@@ -152,11 +196,12 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     if graph.owning_module.meta.get("__spyre_dim_hints") is None:
         graph.owning_module._register_create_node_hook(log_new_nodes)
 
-        graph.owning_module.meta["__spyre_dim_hints"] = [
+        snapshot = [
             (node.target, node.meta.get("custom"))
             for node in graph.nodes
             if node.op == "call_function"
         ]
+        graph.owning_module.meta["__spyre_dim_hints"] = snapshot
 
 
 def recover_spyre_hints(graph: torch.fx.Graph) -> None:
@@ -164,19 +209,28 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     Restore custom meta on AOT-renamed call_function nodes by aligning the
     snapshot from collect_spyre_hints against the current graph on ``target``.
 
-    A simple positional zip is not robust: passes running between collect and
-    recover can insert nodes, most commonly by un-sharing a producer feeding a
-    pointwise op (``add(mm, mm)`` becomes two distinct ``aten.mm.default`` nodes).
-    We instead walk both sequences with a single cursor: a node whose target
-    matches the next snapshot entry consumes it; a node whose target repeats the
-    last consumed entry is treated as a duplicate of that computation and inherits
-    the same hint. This keeps alignment intact across such insertions, where the
-    old count check would bail and silently drop every hint.
+    Passes running between collect and recover can both insert nodes (e.g.
+    decompose_auto_functionalized inserts copy_forced_default) and delete/replace
+    nodes (e.g. auto_functionalized_v2 is replaced). The algorithm must handle
+    both cases:
+
+    - Inserted nodes (in graph, not in snapshot): skip the node, leave it
+      with whatever meta["custom"] it already has.
+    - Deleted nodes (in snapshot, not in graph): skip past the snapshot entry
+      to stay aligned with the graph.
+
+    We implement this as a forward scan: for each graph node, scan forward in
+    the snapshot (from the current cursor) looking for a matching target. If
+    found, consume all snapshot entries up to and including it. If not found,
+    the node was inserted after the snapshot — leave it untouched. A node
+    whose target repeats the last consumed entry is a duplicate (e.g. the
+    second mm in add(mm, mm)) and inherits the same hint.
     """
 
     assert graph.owning_module is not None
 
-    graph.owning_module._unregister_create_node_hook(log_new_nodes)
+    if log_new_nodes in graph.owning_module._create_node_hooks:
+        graph.owning_module._unregister_create_node_hook(log_new_nodes)
 
     _dim_hints = graph.owning_module.meta.pop("__spyre_dim_hints")
     nodes = [n for n in graph.nodes if n.op == "call_function"]
@@ -184,12 +238,21 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     cursor = 0
     last_target = None
     last_custom = None
+    matched = 0
     for node in nodes:
         custom = None
-        if cursor < len(_dim_hints) and _dim_hints[cursor][0] == node.target:
-            last_target, last_custom = _dim_hints[cursor]
+        # Scan snapshot forward to find a matching entry for this node.
+        found_at = None
+        for i in range(cursor, len(_dim_hints)):
+            if _dim_hints[i][0] == node.target:
+                found_at = i
+                break
+        if found_at is not None:
+            # Advance cursor past all skipped (deleted) entries and this one.
+            cursor = found_at + 1
+            last_target, last_custom = _dim_hints[found_at]
             custom = last_custom
-            cursor += 1
+            matched += 1
         elif node.target == last_target:
             # Duplicate of the just-consumed snapshot node (same computation,
             # e.g. the second mm in add(mm, mm)); reuse its hint.
@@ -201,8 +264,13 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
             node.meta["custom"] = {}
         node.meta["custom"].update(custom)
 
-    if cursor != len(_dim_hints):
-        logger.warning(
-            f"Warning: unable to recover spyre hints "
-            f"(matched {cursor}/{len(_dim_hints)} snapshot entries)"
+    # Count hints that actually carry data (None custom = unhinted node).
+    hinted = sum(1 for _, c in _dim_hints if c)
+    if matched < hinted:
+        logger.debug(
+            "recover_spyre_hints: matched %d/%d hinted snapshot entries; "
+            "%d entries were for nodes removed by post-grad passes.",
+            matched,
+            hinted,
+            hinted - matched,
         )

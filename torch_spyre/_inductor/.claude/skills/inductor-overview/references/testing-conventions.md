@@ -10,6 +10,22 @@ Always run pytest as a single sequential process. Never use `-n`,
 `-n auto`, `pytest-xdist`, or any other parallel/distributed test runner
 for any suite in this repo — including in CI-adjacent local scripts.
 
+### Multi-agent/subagent dispatch
+
+The same constraint applies across processes, not just within one — so it
+binds subagent orchestration too. Never dispatch two subagents that both
+run pytest concurrently against Spyre; they'll contend for the device and
+one will fail or hang. When splitting `_inductor` work across subagents:
+
+- Parallelize investigation and code changes (reading passes, drafting
+  fixes) freely — that part doesn't touch the device.
+- Serialize test execution: either designate a single agent (or the
+  orchestrator) to run all tests after the others finish, or have each
+  agent return code changes only and run the combined suite yourself.
+- If a dispatched agent's tests fail with a device-acquisition error,
+  another process is holding the device — don't retry in parallel; rerun
+  sequentially.
+
 ## Local regression scope before pushing
 
 The full `tests/` suite is slow to run locally and CI already covers it in
@@ -22,7 +38,7 @@ constraint above. For a local "did I break anything nearby" pass on
   regardless of which pass you touched.
 - The test file(s) that correspond to the specific pass/module you
   modified, if one exists — e.g. touching `wsr/coarse_tile.py` warrants
-  `tests/inductor/test_coarse_tile_e2e.py`, `test_coarse_tiling.py`; a
+  `tests/inductor/test_for_each_tile_e2e.py`, `test_coarse_tiling.py`; a
   scratchpad allocator change warrants whatever exercises
   `torch_spyre/_inductor/scratchpad/`, etc. Match by name/import, not by
   habit — don't run a fixed list left over from someone else's feature

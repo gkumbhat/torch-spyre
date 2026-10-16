@@ -5,11 +5,11 @@
 Traces written by `torch.profiler` (see [PyTorch Profiler](pytorch_profiler.md))
 are Chrome-trace JSON files. They open in any of three viewers:
 
-- **PyTorch Profiler TensorBoard Plugin** (preferred) — AIU-aware
+- **PyTorch Profiler TensorBoard Plugin** (preferred): AIU-aware
   views on top of the raw trace. Source and install instructions:
   <https://github.com/IBM/kineto-spyre/tree/main/tb_plugin>
-- **Perfetto** — drag and drop the JSON onto <https://ui.perfetto.dev/>
-- **Chrome Trace Viewer** — `chrome://tracing` in Chrome
+- **Perfetto**: drag and drop the JSON onto <https://ui.perfetto.dev/>
+- **Chrome Trace Viewer**: `chrome://tracing` in Chrome
 
 ## Quick start
 
@@ -25,6 +25,42 @@ with profile(
 `tensorboard_trace_handler` writes the trace to `./logs/my_run/` for
 TensorBoard. For Perfetto / Chrome, call `prof.export_chrome_trace("trace.json")`
 and load the file directly.
+
+## What the trace contains
+
+The exported file is [Chrome Trace Event Format][ctf] JSON: a top-level
+object with a `traceEvents` array. Each entry is one timed span. A
+trimmed excerpt looks like this:
+
+```json
+{
+  "traceEvents": [
+    {"ph": "X", "cat": "user_annotation", "name": "iteration_0",
+     "pid": 3153, "tid": 3153, "ts": 1707279511678052, "dur": 1800},
+    {"ph": "X", "cat": "cpu_op", "name": "aten::mm",
+     "pid": 3153, "tid": 3153, "ts": 1707279511678215, "dur": 40},
+    {"ph": "X", "cat": "kernel", "name": "spyre_matmul",
+     "pid": 3153, "tid": 7, "ts": 1707279511678260, "dur": 96,
+     "args": {"device": 0,
+              "cycles_ts": [3463433774,3463433774,3463434222,3463440085,3463440094]}}
+  ]
+}
+```
+
+The values above are illustrative. The fields that matter when reading a
+trace by hand:
+
+- `cat` classifies the span. `user_annotation` marks a `record_function`
+  region, `cpu_op` is a host-side ATen call, and `kernel` is a device-side
+  Spyre kernel.
+- `ts` and `dur` are the start time and duration in microseconds.
+- `tid` separates the trace rows in the viewer. Compute kernels render on
+  device rows named `Stream {N}`. Host-side runtime activities, including
+  `aiuSubmitToHardware` and the `aiuComms*` collective spans emitted by
+  spyre-comms, render on host-thread rows named `Thread {N}`.
+
+Filtering `traceEvents` to `cat == "kernel"` isolates device-side work
+for scripted analysis.
 
 ## `aiu-trace-analyzer`
 
@@ -67,8 +103,9 @@ acelyzer -i <trace_file_json> -c logs.txt
 
 ## See also
 
-- [PyTorch Profiler](pytorch_profiler.md) — generating the traces
-- [Performance analysis methodology](performance_analysis_methodology.md) —
+- [PyTorch Profiler](pytorch_profiler.md): generating the traces
+- [Performance analysis methodology](performance_analysis_methodology.md):
   using a loaded trace
 
 [ata]: https://github.com/IBM/aiu-trace-analyzer
+[ctf]: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview

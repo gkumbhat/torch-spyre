@@ -17,22 +17,19 @@
 Each scenario routes its compile through
 self._stage_and_e2e(...): it asserts across every capture-path stage --
 classification, op-spec structure (IndirectAccess on the output), and SDSC
-fields -- and then runs the kernel end-to-end on the real backend. The e2e run
-reports an expected failure (pytest.xfail) on the value divergence / backend
-abort the backend currently produces for indirect scatter, while the
-capture-path checks above stay strict (a stage regression fails red).
+fields -- and then runs the kernel end-to-end on the real backend.
 
-All scatter scenarios run with SENCORES=1.
+The two forms that crash during compilation -- index_fill (rank-0 scalar
+Constant codegen) and masked_scatter (mask-based CPU fallback) -- stay
+capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 
-Status (validated on hardware build): index-tensor scatters reach a real op
-spec with IndirectAccess on the output (SCATTER_OP_SPEC); the deeptools backend
-diverges from / aborts on the bundle, surfaced here as xfail.
 """
 
 import os
 import sys
 
 import torch
+from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -40,7 +37,7 @@ from indirect_access_common import (  # noqa: E402
     GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
-    IndirectAccessTestCase,
+    register_multicore_variants,
 )
 
 from torch_spyre._C import (  # noqa: E402
@@ -48,12 +45,21 @@ from torch_spyre._C import (  # noqa: E402
     get_device_dtype,
     get_elem_in_stick,
 )
-from torch_spyre._inductor import config  # noqa: E402
 
 
-@config.patch({"sencores": 1})
-class TestScatter(IndirectAccessTestCase):
-    """torch scatter-family ops: one compile + all-stage checks per scenario."""
+# The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
+# the BackendCompilerFailed message.
+_INDEX_STICK_DIM_ERROR = "Expect index stick dim to be innermost in chunk loop order"
+
+
+class _ScatterScenarios:
+    """torch scatter-family ops: one compile + all-stage checks per scenario.
+
+    A plain mixin (not a TestCase, so it is not collected on its own). The
+    concrete, collectable classes ``TestScatter_cores{1,2,4,8,16,32}`` are
+    generated at the bottom of the module by ``register_multicore_variants``,
+    each pinned to its SENCORES value via ``@config.patch``.
+    """
 
     def _row_store(self, M=128, N=256, P=3, dtype=torch.int32):
         """Common row-store operands: out[M,N], src[P,N], 1-D idx[P], all named."""
@@ -105,6 +111,181 @@ class TestScatter(IndirectAccessTestCase):
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, op="exp")
 
+    def test_index_put_batched_dim1(self):
+        """y[:, i] = src -- batched scatter indexing a non-leading dim.
+
+        y[B,M,N], src[B,P,N], 1-D idx[P] shared across the batch: every batch
+        slice scatters its P rows into the same M-dim positions.
+        """
+        Bn, M, N, P = 4, 16, 1024, 6
+        y = torch.rand(Bn, M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(Bn, P, N, dtype=torch.float16).to("spyre")
+        # Unique rows: with a repeated index `y[:, idx] = src` has no defined winner.
+        idx = torch.randperm(M, dtype=torch.int32)[:P].to("spyre")
+        self.name_dims(y, {"B": Bn, "M": M, "N": N})
+        self.name_dims(src, {"B": Bn, "P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[:, idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_put_4d_dim2_default_layout_destination(self):
+        """Scatter on dim 2 of a 4-D destination that has the DEFAULT device layout.
+
+        Indirect access addresses the indexed dimension through the *device* layout and
+        requires it at device position 0. A destination allocated plainly --
+        ``torch.zeros(...).to("spyre")`` -- puts dim 2 elsewhere, so unless the layout
+        is enforced the scatter writes the wrong rows **silently, with no error**
+        (torch-spyre#3705).
+
+        The existing dim-0 and dim-1 scatter tests above do not cover this: their
+        shapes happen to place the indexed dim at device position 0 already. This is
+        the shape a decode-time query stick uses (``[batch, heads, 64, head_dim]``,
+        writing one row), which is where the silent corruption was first observed.
+        """
+        Bn, H, M, N, P = 1, 4, 64, 256, 1
+        dst = torch.zeros(Bn, H, M, N, dtype=torch.float16)
+        src = torch.rand(Bn, H, P, N, dtype=torch.float16)
+        # int64: index_copy_ requires a long index, unlike the index_put tests above.
+        idx = torch.tensor([7], dtype=torch.int64)
+
+        def kernel(dst, src, idx):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        expected = kernel(dst.clone(), src.clone(), idx.clone())
+        actual = torch.compile(kernel, dynamic=False)(
+            dst.clone().to("spyre"), src.to("spyre"), idx.to("spyre")
+        ).to("cpu")
+        torch.testing.assert_close(actual, expected)
+
+    def test_index_copy_transposed_source(self):
+        """Scatter a computed ``[B, L, H, D] -> [B, H, L, D]`` view.
+
+        RoPE produces K in this form before writing it into a pinned KV cache.
+        The cache is longer than K, so an inserted restickify must retain K's
+        source geometry rather than inheriting the destination extent.  The
+        scatter must not require an explicit ``contiguous()`` in the model.
+        """
+        Bn, H, L, D, M = 1, 8, 320, 256, 384
+        dtype = torch.bfloat16
+        generator = torch.Generator().manual_seed(0)
+        src = torch.randn(Bn, L, H, D, dtype=dtype, generator=generator)
+        freqs = torch.randn(Bn, L, 2, 2, D // 2, dtype=dtype, generator=generator)
+        dst = torch.zeros(Bn, H, M, D, dtype=dtype)
+        cache_layout = SpyreTensorLayout(
+            device_size=[
+                M,
+                H,
+                D // get_elem_in_stick(dtype),
+                Bn,
+                get_elem_in_stick(dtype),
+            ],
+            stride_map=[D, M * D, get_elem_in_stick(dtype), H * M * D, 1],
+            device_dtype=get_device_dtype(dtype),
+        )
+
+        def apply_rope(src, freqs):
+            source = src.transpose(1, 2)
+            source = source.transpose(1, 2).reshape(Bn, L, H, 2, D // 2)
+            return (
+                freqs[:, :, None, :, :, :]
+                .mul(source.unsqueeze(-3))
+                .sum(4, keepdim=True)
+                .flatten(3)
+                .transpose(1, 2)
+            )
+
+        def kernel(dst, src, freqs, idx):
+            source = apply_rope(src, freqs)
+            dst.index_copy_(2, idx, source)
+            return dst
+
+        def kernel_with_contiguous_source(dst, src, freqs, idx):
+            source = apply_rope(src, freqs).contiguous()
+            dst.index_copy_(2, idx, source)
+            return dst
+
+        spyre_src = src.to("spyre")
+        spyre_freqs = freqs.to("spyre")
+        idx = torch.arange(L, dtype=torch.int64)
+        expected = kernel(dst.clone(), src, freqs, idx)
+        actual = torch.compile(kernel, dynamic=False)(
+            dst.to("spyre", device_layout=cache_layout),
+            spyre_src,
+            spyre_freqs,
+            idx.to("spyre"),
+        ).to("cpu")
+        contiguous_actual = torch.compile(kernel_with_contiguous_source, dynamic=False)(
+            dst.to("spyre", device_layout=cache_layout),
+            spyre_src,
+            spyre_freqs,
+            idx.to("spyre"),
+        ).to("cpu")
+        torch.testing.assert_close(actual, contiguous_actual)
+        # CPU and Spyre may accumulate the two-term bf16 RoPE reduction in a
+        # different order; layout corruption is orders of magnitude larger.
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.02)
+
+    def test_index_put_p7(self):
+        """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
+        M, N, P = 16, 1024, 7
+        y = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, N, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_put_3d_dim0(self):
+        """y[idx] = src -- 3-D scatter on dim 0.
+
+        y[M,N,K], src[P,N,K], 1-D idx[P]: scatter P rows into M dimension
+        of a 3-D tensor.
+        """
+        M, N, K, P = 32, 64, 128, 8
+        y = torch.rand(M, N, K, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, N, K, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "N": N, "K": K})
+        self.name_dims(src, {"P": P, "N": N, "K": K})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_put_4d_dim0(self):
+        """y[idx] = src -- 4-D scatter on dim 0.
+
+        y[M,N,K,L], src[P,N,K,L], 1-D idx[P]: scatter P rows into M dimension
+        of a 4-D tensor.
+        """
+        M, N, K, L, P = 16, 32, 64, 256, 6
+        y = torch.rand(M, N, K, L, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, N, K, L, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "N": N, "K": K, "L": L})
+        self.name_dims(src, {"P": P, "N": N, "K": K, "L": L})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
     def test_scatter(self):
         """torch.scatter(out, 0, index, src)"""
         out, src, index = self._full_index_store(dtype=torch.int64)
@@ -112,7 +293,16 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return torch.scatter(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_scatter_method_without_unary(self):
         """out.scatter_(0, index, src) -- in-place method form without a unary."""
@@ -121,7 +311,16 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_scatter_with_exp(self):
         """y.scatter_(0, index, src.exp()) -- fused unary, exp runs on Spyre.
@@ -135,6 +334,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_(0, index, src.exp())
 
+        # The backend scheduler rejects the bundle (#4409); drop the pin once fixed.
         self._stage_and_e2e(
             kernel,
             out,
@@ -143,6 +343,7 @@ class TestScatter(IndirectAccessTestCase):
             expect=SCATTER_OP_SPEC,
             op="exp",
             detected=False,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
         )
 
     def test_scatter_add(self):
@@ -152,7 +353,16 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_add_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_index_copy(self):
         """torch.index_copy(out, 0, idx, src).
@@ -166,6 +376,167 @@ class TestScatter(IndirectAccessTestCase):
             return torch.index_copy(out, 0, idx, src)
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_copy_inplace_3d(self):
+        """out.index_copy_(0, idx, src) for 3-D tensor [rows, 8, 128] covering small
+        row counts including the P=1 single-row scatter scenario (rows in (1, 2)).
+        """
+
+        def store(out, index, src):
+            out.index_copy_(0, index, src)
+
+        for rows in (1, 2):
+            with self.subTest(rows=rows):
+                torch._dynamo.reset()
+                out = torch.zeros(rows, 8, 128, dtype=torch.float16, device="spyre")
+                src = torch.randn(rows, 8, 128, dtype=torch.float16).to("spyre")
+                idx = torch.arange(rows, dtype=torch.int64).to("spyre")
+                torch.compile(store, dynamic=False)(out, idx, src)
+                self.assertFalse(
+                    bool(out.cpu().eq(0).all()),
+                    f"rows={rows}: destination still all zero?",
+                )
+
+    def test_index_copy_inplace_3d_e2e(self):
+        """Regression test for index_copy_ on 3-D tensor [rows, 8, 128] covering
+        the P=1 (rows=1) single-row write path (verifying writes are not silently elided)
+        and normal scatter (rows=2), comparing results against CPU reference.
+        """
+        for rows in (1, 2):
+            with self.subTest(rows=rows):
+                torch._dynamo.reset()
+                out = torch.zeros(rows, 8, 128, dtype=torch.float16)
+                src = torch.randn(rows, 8, 128, dtype=torch.float16)
+                idx = torch.arange(rows, dtype=torch.int64)
+
+                def store(out, idx, src):
+                    out.index_copy_(0, idx, src)
+                    return out
+
+                self._assert_compiled_matches_cpu(
+                    store, out.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+                )
+
+    def test_index_put_p1_2d_e2e(self):
+        """Regression: P=1 index_put on a 2-D default-layout destination.
+
+        The core P=1 bug: Inductor eliminates the scatter-index loop when the
+        index has exactly one element.  Before the fix, _build_indirect_store_subs
+        returned no scatter symbols, requirement was None, and the destination
+        layout was never enforced -- so out[idx] = src silently wrote nothing.
+        This is the simplest 2-D manifestation of that path.
+        """
+        M, N = 64, 256
+        for idx_val in (0, M // 2, M - 1):
+            with self.subTest(idx_val=idx_val):
+                torch._dynamo.reset()
+                out = torch.zeros(M, N, dtype=torch.float16)
+                src = torch.randn(1, N, dtype=torch.float16)
+                idx = torch.tensor([idx_val], dtype=torch.int64)
+
+                def store(out, idx, src):
+                    out[idx] = src
+                    return out
+
+                self._assert_compiled_matches_cpu(
+                    store, out.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+                )
+
+    def test_index_put_p1_3d_e2e(self):
+        """Regression: P=1 index_put on a 3-D default-layout tensor.
+
+        Mirrors test_index_put_3d_dim0 but with P=1 to exercise the P=1
+        singleton-placeholder path through _p1_scatter_device_pos for a 3-D
+        shape (device layout has an extra non-stick leading dim).
+        """
+        M, N, K = 32, 8, 128
+        for idx_val in (0, M - 1):
+            with self.subTest(idx_val=idx_val):
+                torch._dynamo.reset()
+                out = torch.zeros(M, N, K, dtype=torch.float16)
+                src = torch.randn(1, N, K, dtype=torch.float16)
+                idx = torch.tensor([idx_val], dtype=torch.int64)
+
+                def store(out, idx, src):
+                    out[idx] = src
+                    return out
+
+                self._assert_compiled_matches_cpu(
+                    store, out.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+                )
+
+    def test_index_copy_p1_4d_nonleading_dim_e2e(self):
+        """Regression: P=1 index_copy_ on a 4-D tensor where the scattered dim
+        is NOT dim 0.
+
+        Mirrors test_index_put_4d_dim2_default_layout_destination (P=1 there too,
+        but via index_copy_ on dim 2 of [Bn, H, M, N]).  The default device layout
+        places dim 2 behind dim 1 (H) in device address space, so without layout
+        enforcement the single-row write lands at the wrong address or is elided.
+        """
+        Bn, H, M, N = 1, 4, 64, 256
+        dst = torch.zeros(Bn, H, M, N, dtype=torch.float16)
+        src = torch.randn(Bn, H, 1, N, dtype=torch.float16)
+        idx = torch.tensor([7], dtype=torch.int64)
+
+        def kernel(dst, idx, src):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        self._assert_compiled_matches_cpu(
+            kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+        )
+
+    def test_index_copy_p1_multi_singleton_target_dim1_e2e(self):
+        """Regression: P=1 scatter targeting dim=1 on a shape with multiple singleton dimensions [1, 1, 64, 256].
+
+        When a tensor contains multiple singleton dimensions, the disambiguation logic in
+        _p1_scatter_device_pos ensures dim 1 is targeted and rotated outermost instead of
+        wrongly picking dim 0.
+        """
+        batch, num_heads, seq, head_dim = 1, 1, 64, 256
+        dst = torch.zeros(batch, num_heads, seq, head_dim, dtype=torch.float16)
+        src = torch.randn(batch, 1, seq, head_dim, dtype=torch.float16)
+        idx = torch.tensor([0], dtype=torch.int64)
+
+        def kernel(dst, idx, src):
+            dst.index_copy_(1, idx, src)
+            return dst
+
+        self._assert_compiled_matches_cpu(
+            kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+        )
+
+    def test_index_copy_p1_multi_singleton_target_dim2_e2e(self):
+        """Regression: P=1 scatter targeting dim=2 on a shape with multiple leading singleton dimensions [1, 1, 64, 256]."""
+        batch, num_heads, seq, head_dim = 1, 1, 64, 256
+        dst = torch.zeros(batch, num_heads, seq, head_dim, dtype=torch.float16)
+        src = torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16)
+        idx = torch.tensor([7], dtype=torch.int64)
+
+        def kernel(dst, idx, src):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        self._assert_compiled_matches_cpu(
+            kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+        )
+
+    def test_index_put_decode_e2e(self):
+        """Regression: P=1 index_put on a paged-KV-cache-shaped layout.
+
+        Symmetric to test_index_copy_decode_e2e: the same single-token decode
+        shape ([576, 8, 128], P=1) but accessed via index_put (out[idx] = src)
+        instead of index_copy.  Pins that the P=1 fix applies to both surface
+        APIs when the destination has a custom (non-default) device layout.
+        """
+        cache, src, idx = self._paged_kv_cache_operands(P=1)
+
+        def kernel(c, s, i):
+            c[i] = s
+            return c
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
 
     def _paged_cache_layout(self, L=576, H=8, D=128):
         """The paged-KV-cache device layout for a [L, H, D] fp16 tensor: L
@@ -193,7 +564,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def _assert_compiled_matches_cpu(self, kernel, *dev_args):
         """Run `kernel` through torch.compile on device and require the result
-        to match the CPU eager reference -- a hard assertion, not an xfail.
+        to match the CPU eager reference -- a hard assertion.
         Compute CPU reference from pristine inputs before compiled run to catch
         mutations that corrupt non-indexed regions."""
         cpu_args = [
@@ -298,14 +669,372 @@ class TestScatter(IndirectAccessTestCase):
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
+    # ===== index_add: gather + add + overwrite-scatter decomposition =====
+    # aten.index_add lowers (spyre_index_add in decompositions.py) to
+    # index_select (indirect gather) + add + index_put (indirect overwrite
+    # store). The final store is an indirect OUTPUT, so each scenario still
+    # classifies as SCATTER_OP_SPEC (_label_for checks indirect-output first).
+
+    def _index_add_operands(
+        self,
+        M=128,
+        N=256,
+        P=3,
+        *,
+        data_dtype=torch.float16,
+        idx_dtype=torch.int32,
+        nonzero_dest=False,
+        idx=None,
+    ):
+        """Operands for index_add scenarios: out[M,N], src[P,N], 1-D idx[P].
+
+        Parameters
+        ----------
+        M, N, P:
+            Destination rows, feature width, and number of updated rows.
+        data_dtype:
+            Element dtype for out and src (float16 or float32).
+        idx_dtype:
+            Dtype for the index tensor (int32 or int64).
+        nonzero_dest:
+            When True, out is filled with random values instead of zeros.
+            Use this to pin that the gather step reads the existing dest
+            values (gathered + src, not just src).
+        idx:
+            Explicit CPU index tensor of length P.  When None the helper
+            generates torch.arange(P), producing the consecutive unique
+            indices used by the majority of scenarios.  Pass an explicit
+            tensor for boundary rows, strided, or random-permutation indices.
+        """
+        out_data = (
+            torch.rand(M, N, dtype=data_dtype)
+            if nonzero_dest
+            else torch.zeros(M, N, dtype=data_dtype)
+        )
+        out = out_data.to("spyre")
+        src = torch.rand(P, N, dtype=data_dtype).to("spyre")
+        if idx is None:
+            idx = torch.arange(P, dtype=idx_dtype).to("spyre")
+        else:
+            idx = idx.to(idx_dtype).to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+        return out, src, idx
+
+    # NOTE: index_add lowers to gather (index_select) + add + overwrite-scatter
+    # (index_put), so the bundle is BOTH a gather and a scatter. It still
+    # classifies as SCATTER_OP_SPEC (terminal indirect-output store), but
+    # assert_indirect_sdsc_fields' scatter-only invariant ("every indirect value
+    # tensor is the output") does not hold -- the gather's value tensor is an
+    # input. Hence sdsc=False on these (classification + e2e still run).
+
     def test_index_add(self):
-        """out.index_add_(0, idx, src)"""
-        out, src, idx = self._row_store()
+        """out.index_add_(0, idx, src) -- canonical row scatter-add."""
+        out, src, idx = self._index_add_operands()
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_narrow_feature(self):
+        """Small feature dim (N=4), far below one stick."""
+        out, src, idx = self._index_add_operands(N=4)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_single_index(self):
+        """P == 1: a single-row update (decode-step shape)."""
+        out, src, idx = self._index_add_operands(P=1)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_many_updates(self):
+        """More update rows (P=32) into a 128-row destination."""
+        out, src, idx = self._index_add_operands(M=128, P=32)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_int64_index(self):
+        """int64 index (downcast to int32 on device)."""
+        out, src, idx = self._index_add_operands(idx_dtype=torch.int64)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_alpha(self):
+        """torch.index_add with a non-unit alpha scaling factor (0.5, 1.0, 2.0)."""
+        for alpha in (0.5, 1.0, 2.0):
+            out, src, idx = self._index_add_operands(
+                M=8,
+                N=4,
+                P=3,
+                data_dtype=torch.float32,
+                idx_dtype=torch.int64,
+                idx=torch.tensor([1, 3, 6]),
+            )
+
+            def kernel(out, src, idx, _alpha=alpha):
+                return torch.index_add(out, 0, idx, src, alpha=_alpha)
+
+            self._assert_compiled_matches_cpu(kernel, out, src, idx)
+
+    def test_index_add_3d(self):
+        """3-D destination [M, A, B], scatter-add along dim 0."""
+        M, A, B, P = 128, 8, 64, 3
+        out = torch.zeros(M, A, B, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, A, B, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": M, "A": A, "B": B})
+        self.name_dims(src, {"P": P, "A": A, "B": B})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_moe_shape(self):
+        """MoE shape [64,2816], P=3."""
+        out, src, idx = self._index_add_operands(
+            M=64,
+            N=2816,
+            P=3,
+            nonzero_dest=True,
+        )
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_tiny_zeros(self):
+        """Sanity: [8,4] dest (zeros), 3 unique indices, functional API."""
+        out, src, idx = self._index_add_operands(
+            M=8,
+            N=4,
+            P=3,
+            idx=torch.tensor([0, 2, 5], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_nonzero_dest(self):
+        """Gather correctness: [8,4] non-zero dest -- gathered values must be
+        added to src, not src written directly."""
+        out, src, idx = self._index_add_operands(
+            M=8,
+            N=4,
+            P=3,
+            nonzero_dest=True,
+            idx=torch.tensor([1, 4, 7], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_moe_inplace(self):
+        """MoE full-coverage inplace: [64,2816] dest, all 64 rows updated via
+        index_add_().  The original user-reported failing shape."""
+        out, src, idx = self._index_add_operands(M=64, N=2816, P=64)
+
+        def kernel(out, src, idx):
+            out = out.clone()
+            out.index_add_(0, idx, src)
+            return out
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_moe_functional(self):
+        """MoE full-coverage functional: same [64,2816] shape via
+        torch.index_add (out-of-place)."""
+        out, src, idx = self._index_add_operands(M=64, N=2816, P=64)
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_partial_update(self):
+        """Partial update: [128,256] dest, only 3 rows (first, middle, last).
+        Non-indexed rows must be unchanged."""
+        out, src, idx = self._index_add_operands(
+            M=128,
+            N=256,
+            P=3,
+            nonzero_dest=True,
+            idx=torch.tensor([0, 63, 127], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_dense_update(self):
+        """Dense update: [64,256] dest, every other row updated (32 of 64)."""
+        out, src, idx = self._index_add_operands(
+            M=64,
+            N=256,
+            P=32,
+            nonzero_dest=True,
+            idx=torch.arange(0, 64, 2, dtype=torch.int32),  # 0,2,...,62
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_large_p(self):
+        """Large P: [32,512] dest, 24 of 32 rows updated (randomly chosen)."""
+        _idx = (
+            torch.randperm(32, generator=torch.Generator().manual_seed(0))[:24]
+            .sort()
+            .values
+        )
+        out, src, idx = self._index_add_operands(
+            M=32,
+            N=512,
+            P=24,
+            nonzero_dest=True,
+            idx=_idx,
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_ragged_n(self):
+        """Non-aligned N: [64,63] dest -- N is not a multiple of stick size (64)."""
+        out, src, idx = self._index_add_operands(M=64, N=63, P=8)
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_fp32(self):
+        """fp32 dtype: [16,128] dest, 5 unique indices."""
+        out, src, idx = self._index_add_operands(
+            M=16,
+            N=128,
+            P=5,
+            data_dtype=torch.float32,
+            idx=torch.tensor([1, 3, 7, 10, 14], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+        )
+
+    def test_index_add_dim1_unsupported(self):
+        """index_add along dim=1 (column scatter-add) is unsupported. The gather
+        (index_select) leg puts the index-dependent coordinate on a non-outermost
+        device dim, and propagate_layouts finds no supported output layout
+        (indirect access requires the indexed dim outermost). The compile aborts,
+        surfaced here as CRASHED."""
+        M, N, P = 4, 8, 3
+        out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(M, P, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"M": M, "P": P})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(out, src, idx):
+            return out.index_add_(1, idx, src)
+
+        self.check(kernel, out, src, idx, expect=CRASHED)
 
     def test_scatter_reduce(self):
         """out.scatter_reduce_(0, index, src, "sum")"""
@@ -314,7 +1043,16 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "sum")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_index_put_accumulate(self):
         """out.index_put_((idx,), src, accumulate=True) -- out[idx] += src."""
@@ -332,7 +1070,16 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return torch.scatter_add(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
     def test_scatter_reduce_amax(self):
@@ -342,7 +1089,10 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amax")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        # The device result is wrong (#5326); drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=False
+        )
 
     def test_scatter_reduce_amin(self):
         """out.scatter_reduce_(0, index, src, "amin")"""
@@ -365,6 +1115,10 @@ class TestScatter(IndirectAccessTestCase):
     # -- Known crashes (separate from the indirect-store path) -------------
     def test_index_fill_crashes(self):
         """out.index_fill_(0, idx, 0.0) -- scalar fill -> rank-0 Constant codegen."""
+        # Main 6e92c9ec and lift 89c7c210 both reject the scalar Constant
+        # before producing an OpSpec. The lift also rejects this unsupported
+        # scatter's missing index bound during preflight; this is not a
+        # successful-finalization case and must not hide any other fallback.
         out = torch.rand(128, 256, dtype=torch.float16).to("spyre")
         idx = torch.randint(0, 128, (3,), dtype=torch.int32).to("spyre")
         self.name_dims(out, {"M": 128, "N": 256})
@@ -373,7 +1127,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, idx):
             return out.index_fill_(0, idx, 0.0)
 
-        self.check(kernel, out, idx, expect=CRASHED)
+        result = self.check(kernel, out, idx, expect=CRASHED)
+        self.assertIn("store value of unexpected type", str(result.exc))
+        self.assertIn("Constant", str(result.exc))
 
     def test_masked_scatter_element_mask_unsupported(self):
         """Element-level mask (stride(-1) != 0): the decomposition rejects it.
@@ -417,9 +1173,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def test_masked_scatter_unexpanded_row_broadcast(self):
         """torch.masked_scatter with a row mask left in its UN-EXPANDED form:
@@ -446,9 +1200,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def _row_broadcast_operands(self, shape, src_rows, n_true):
         """Supported masked_scatter operands: `self` of `shape`, a mask broadcast
@@ -510,9 +1262,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def test_masked_scatter_no_rows_selected(self):
         """All-False mask: nothing is selected, so the result must equal `self`
@@ -528,9 +1278,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def test_masked_scatter_degenerate_last_dim_unsupported(self):
         """Degenerate last dim (cols == 1): a single-column row is not a real
@@ -548,6 +1296,85 @@ class TestScatter(IndirectAccessTestCase):
             return torch.masked_scatter(inp, mask, src)
 
         self.check(kernel, inp, mask, src, expect=CRASHED)
+
+
+# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
+# / run each op and do not depend on the core count, so sweeping them across every
+# SENCORES value added little coverage for a 7x test-count blowup.
+register_multicore_variants(_ScatterScenarios, "TestScatter", globals(), counts=(32,))
+
+
+class _ScatterMulticoreScenarios:
+    """Scatter scenarios whose BEHAVIOUR depends on the core count -- the
+    work-division split-map tests -- swept across SENCORES, unlike the
+    op-behaviour scenarios above (which run once at 32). See MULTICORE_SENCORES."""
+
+    # -- Work-division scenarios -----------------------------------------
+    # Swept across SENCORES, so each TestScatterMulticore_cores{N} variant
+    # checks the split map that N produces. The invariant for dest[i] = src: the
+    # planner must split the index-entry dim (c0) and never the destination data
+    # dim (c1 = K) -- splitting K makes every core write address 0 of the shared
+    # destination, silently returning wrong results. Shapes are chosen so the
+    # planner *would* prefer K if the guard were absent. assert_indexed_dim_split()
+    # reads the current SENCORES and expects c0 to split by
+    # min(SENCORES, index_size // 32) with c1 pinned at 1.
+    #
+    # After the split-map check each scenario runs through the shared
+    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
+    # executed the split-map compile and the overwrite-scatter mutates its
+    # destination) -- the same capture-path stage checks + e2e leg every other
+    # scatter scenario uses -- so the multicore split is also exercised
+    # end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split -- nothing
+    # to divide.)
+
+    @staticmethod
+    def _scatter_fn(dst, s, idx):
+        dst[idx] = s
+        return dst
+
+    def test_work_division_entry_split_full(self):
+        """Entry dim has 32 sticks (Q=1024): it would split a full 32 ways, but
+        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it below
+        that, so at SENCORES=32 core_split rounds it down to 16-way while dest
+        K=64 stays unsplit. Verifies the split map and that the cap keeps a
+        full-scale entry off the 32-way path the backend rejects (a per-core
+        address past 4 GB overflows its uint32 UINT32_TO_16* encoding)."""
+
+        def make():
+            # One destination row per entry: with a repeated index `dest[i] = src`
+            # has no defined winner, so the device could not be checked.
+            src = torch.rand(1024, 64, 1024, dtype=torch.float16).to("spyre")
+            dest = torch.zeros(1024, 64, 1024, dtype=torch.float16).to("spyre")
+            i = torch.randperm(1024).int().to("spyre")
+            return dest, src, i
+
+        fn = self._scatter_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
+
+    def test_work_division_entry_split_capped(self):
+        """Entry dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
+        caps at 8 and must never spill onto the forbidden dest K dim."""
+
+        def make():
+            # One destination row per entry (see test_work_division_entry_split_full).
+            src = torch.rand(256, 64, 256, dtype=torch.float16).to("spyre")
+            dest = torch.zeros(256, 64, 256, dtype=torch.float16).to("spyre")
+            i = torch.randperm(256).int().to("spyre")
+            return dest, src, i
+
+        fn = self._scatter_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
+
+
+# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
+# split-map tests -- are swept across all SENCORES values.
+register_multicore_variants(
+    _ScatterMulticoreScenarios, "TestScatterMulticore", globals()
+)
 
 
 if __name__ == "__main__":

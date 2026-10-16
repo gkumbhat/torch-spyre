@@ -19,16 +19,16 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <cstdint>
+#include <memory>
 #include <vector>
 
+#include "job_plan.h"
 #include "module.h"
 #include "spyre_error.h"
 #include "spyre_kernel.h"
 
 namespace spyre {
-
-// Forward declaration
-struct JobPlan;
 
 class SpyreStream {
  private:
@@ -51,7 +51,8 @@ class SpyreStream {
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
 
-  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
+  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args,
+              std::vector<SymbolicArg> symbolic_args = {}) const;
 
   // Typed flex operation launches. These are the single chokepoint through
   // which torch-spyre submits work to the underlying flex stream; the raw
@@ -61,10 +62,11 @@ class SpyreStream {
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
   // Device-side MEMORY_FILL DMA. Routes through the typed
-  // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
-  // conversion internally (no FillParams construction here).
-  void fillAsync(const flex::CompositeAddress* dst, double value,
-                 DataFormats dtype, bool use_dmai) const;
+  // flex::RuntimeStream::launchOperation(FillAsyncParams*) wrapper, which
+  // performs the value->pattern conversion internally.
+  void launchFillAsync(flex::FillAsyncParams* params) const;
+  // Host-side compute for deeptools host compute calls.
+  flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
 
   // Conversions
   c10::Stream unwrap() const;
@@ -75,7 +77,7 @@ class SpyreStream {
 
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
-  void copyAsyncImpl(void* cpu_ptr,
+  void copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
                      const flex::CompositeAddress* device_address,
                      const DataConversionInfo* dci, bool host2device) const;
 };

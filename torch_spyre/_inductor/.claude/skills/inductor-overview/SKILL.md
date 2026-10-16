@@ -25,6 +25,14 @@ your code. See
 for the cache-layer breakdown and where to find generated SDSC/superdsc
 JSON, MLIR bundles, and `output_code.py` for a given compilation.
 
+## Getting log/debug output
+
+Unsure which `TORCH_LOGS` setting, component name, or env var turns on
+Spyre logging (Python or C++)? Use the sibling `logging` skill in this
+same `.claude/skills/` directory — it covers the `torch_spyre.*` vs.
+`spyre.*` namespace split, the `+`/`-`/no-prefix level syntax, and why
+dynamic per-pass loggers can't be targeted directly in `TORCH_LOGS`.
+
 ## Layout and stride semantics
 
 `stride_map`, `device_stride`, and `pytorch_stride` measure three
@@ -58,7 +66,7 @@ assuming from the allocation kind alone.
 
 ## `WrapperHandler` swaps must account for stride, not just name
 
-CLAUDE.md's "wrap, never reconstruct" rule for `ComputedBuffer.inner_fn`
+AGENTS.md's "wrap, never reconstruct" rule for `ComputedBuffer.inner_fn`
 covers *why* to use a `WrapperHandler`. The failure mode to watch for once
 you're using one: a plain `NameSwapHandler`-style rename forwards a
 consumer's load index **unmodified**. That's correct when the old and new
@@ -68,11 +76,11 @@ a consumer from a tile-local scratch buffer to a full-size buffer after
 promoting the consumer's own iteration space). `_patch_consumers` in
 `wsr/coarse_tile.py` hit exactly this bug historically and now carries the
 fix as its documented pattern: it computes a stride-coefficient rewrite
-map (`_stride_rewrite_map`) and applies it via
-`_retile_load_index_from_strides`/`_NameAndIndexSwapHandler` whenever the
-old and new buffer strides differ, falling back to plain `NameSwapHandler`
-only when they don't. Any new pass that swaps a buffer name/identity under
-a consumer's `inner_fn` should check whether this applies — a bare rename
+via `_retile_load_index` (parameterized by a `_RetiledBufferInfo`) and
+applies it through `_NameAndIndexSwapHandler` whenever the old and new
+buffer strides differ, falling back to plain `NameSwapHandler` only when
+they don't. Any new pass that swaps a buffer name/identity under a
+consumer's `inner_fn` should check whether this applies — a bare rename
 is only safe when the swap is addressing-equivalent.
 
 ## Test execution conventions
@@ -85,5 +93,5 @@ for the specific suites to run locally instead.
 
 ## Adding to this skill
 
-Follow the top-level `CLAUDE.md` conventions for `SKILL.md` frontmatter:
+Follow the top-level `AGENTS.md` conventions for `SKILL.md` frontmatter:
 a quoted single-line `description`, not a multi-line `>-` block scalar.

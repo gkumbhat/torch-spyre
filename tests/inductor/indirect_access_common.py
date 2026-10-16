@@ -36,14 +36,12 @@ computeOp routing. bundle_jsons_from_captured lets a test that only captured
 op specs move on to that same SDSC validation without recompiling.
 
 run_e2e drives the real backend (no mocking), mirroring the standalone
-gather.py script: it compiles and runs on device, then reports an *expected
-failure* (pytest.xfail) when the values diverge from the CPU reference or the
-backend aborts -- because the backend does not yet implement indirect access
-correctly. The xfail is raised after the capture-path stage checks run, so those
-stay strict; when the backend is fixed and results match, no xfail is raised and
-the test passes (xpass alerts you if a hard-coded expectation goes stale). For
-expect_close=True ops a mismatch/failure is instead a hard error. Only gather
-reaches this path today; the name is generic so scatter can reuse it later.
+gather.py script: it compiles and runs on device and asserts the result matches
+the CPU reference. A backend failure or a value mismatch fails the test. A known
+backend gap is pinned explicitly, after the capture-path stage checks (which stay
+strict): ``expect_backend_error`` asserts the compile raises with that message,
+and ``expect_close=False`` asserts the values diverge. Either pin fails the day
+the gap is fixed, which is the cue to drop it. Gather and scatter both use it.
 """
 
 import contextlib
@@ -53,7 +51,6 @@ import json
 import math
 import os
 import tempfile
-from subprocess import CalledProcessError
 from unittest.mock import patch
 
 import pytest
@@ -130,7 +127,7 @@ def capture_op_specs():
     """
     captured: list[list] = []
 
-    def _spy(self, kernel_name, specs):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
         captured.append(list(specs))
         return _NoopRunner()
 
@@ -146,7 +143,7 @@ def capture_sdsc_calls():
     """
     calls: list[tuple[str, list]] = []
 
-    def _spy(self, kernel_name, specs):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
         calls.append((kernel_name, list(specs)))
         return _NoopRunner()
 
@@ -257,6 +254,13 @@ DIRECT_OP_SPEC = "op_spec_no_indirect"  # Generated OpSpec without indirect acce
 UNIMPLEMENTED = "unimplemented_op"  # Hit an UnimplementedOp
 NO_SPYRE_OP = "no_spyre_op_spec"  # Fell back to CPU
 
+# Core counts to sweep in the multicore variants of the indirect-access suites.
+# 1 keeps the original single-core coverage; the rest exercise the work-division
+# planner (index-dim splitting, shared-table / scatter-row never-split
+# constraints) at every supported SENCORES value. 6 is included as a
+# non-power-of-two count so uneven core-vs-stick divisions are covered too.
+MULTICORE_SENCORES = (1, 2, 4, 6, 8, 16, 32)
+
 
 def _label_for(exc, op_specs, entries) -> str:
     """Map a compilation outcome to one of the classification constants."""
@@ -314,7 +318,10 @@ def generate_sdsc_jsons(kernel, *dev_args) -> dict:
     for ci, specs in enumerate(captured):
         sub = os.path.join(out, f"kernel{ci}")
         os.makedirs(sub, exist_ok=True)
-        generate_bundle(f"kernel{ci}", sub, specs)
+        # This exercises SDSC JSON generation, not hardware pool sizing, so a
+        # placeholder non-zero size satisfies generate_bundle's pool_size
+        # validation whenever a pool symbol happens to be present.
+        generate_bundle(f"kernel{ci}", sub, specs, pool_size=1024)
         for path in sorted(glob.glob(os.path.join(sub, "sdsc_*.json"))):
             with open(path) as f:
                 jsons[os.path.relpath(path, out)] = json.load(f)
@@ -392,49 +399,36 @@ def run_e2e(
     *dev_args,
     atol: float = 0.01,
     rtol: float = 0.01,
-    expect_close: bool | None = None,
+    expect_close: bool = True,
+    expect_backend_error: str | None = None,
 ):
     """Compile and run an indirect-access kernel end-to-end on the real Spyre
     backend and validate the device result against the CPU reference.
 
     Unlike the capture-based helpers, this mocks nothing: it drives the full
-    `bundle -> dxp_standalone -> launch_jobplan` path, exactly like the
+    `bundle -> backend compiler -> launch_jobplan` path, exactly like the
     standalone `tests/indirect_access/gather.py` script.  `dev_args` are the
     device tensors the kernel is invoked with; the CPU reference is computed
     from their host copies.
 
-    Today only gather kernels reach the indirect path -- the name is
-    deliberately generic so scatter (and other indirect ops) can reuse it once
-    the backend supports them.
-
     The CPU reference is computed first; if *that* raises it is a problem with
     the test itself (e.g. an out-of-bounds index) and is allowed to propagate.
 
-    The device compile/run is best-effort: the backend does not yet support
-    every indirect-access pattern and aborts (SIGABRT in dxp_standalone) on some
-    of them. A backend failure -- and likewise a value divergence -- is reported
-    as an *expected failure* (pytest.xfail) rather than warned or hard-failed, so
-    "always run e2e" surfaces known backend gaps as xfail (and flips to xpass the
-    day the backend is fixed) without turning the suite red. Because xfail is
-    raised imperatively *after* the capture-path stage checks have run, those
-    checks stay strict. (For `expect_close=True` ops, which must work, a failure
-    or divergence is a hard assertion/raise instead.)
+    A backend failure raises, and a value mismatch fails the assertion.  Two
+    keywords pin a known backend gap instead; both fail once the gap is fixed,
+    so the pin has to be removed then:
+
+      * `expect_backend_error` -- a regex; assert that the backend compile/run
+        fails with ``BackendCompilerFailed`` whose message matches it;
+      * `expect_close=False` -- assert the backend runs but its values diverge
+        from the CPU reference.
 
     Result validation:
       * the output is checked for the correct shape and dtype;
       * the values are compared against the golden CPU reference and the
-        max-abs-diff recorded;
-      * `expect_close` controls the value assertion:
-          - `True`  -> assert the result matches (use for ops that must be
-                         correct, e.g. a supported direct op or CPU fallback);
-          - `False` -> assert the result diverges (pin a known-bad path);
-          - `None`  -> xfail on divergence (the default for on-device indirect
-                         gather, which the backend does not yet implement
-                         correctly). When it is fixed and results match, no xfail
-                         is raised and the test simply passes.
+        max-abs-diff recorded, within `atol`/`rtol`.
 
-    Returns an `E2EResult` when the result matched (or expect_close handled it);
-    on divergence/backend failure it raises pytest.xfail and does not return.
+    Returns an `E2EResult`; with `expect_backend_error` its `result` is None.
     """
     reference = kernel(
         *[a.cpu() if isinstance(a, torch.Tensor) else a for a in dev_args]
@@ -442,17 +436,13 @@ def run_e2e(
 
     # Recompile from scratch so the run exercises a fresh bundle.
     torch._dynamo.reset()
-    try:
-        result = torch.compile(kernel)(*dev_args).cpu()
-    except (BackendCompilerFailed, CalledProcessError) as exc:
-        if expect_close:
-            raise  # a must-work op failing to compile/run is a real regression
-        pytest.xfail(
-            "e2e backend compile/run failed "
-            f"({type(getattr(exc, '__cause__', None) or exc).__name__}); the "
-            "Spyre backend does not yet support this indirect-access pattern. "
-            "The capture-path stages still validated the bundle."
+    if expect_backend_error is not None:
+        with pytest.raises(BackendCompilerFailed, match=expect_backend_error):
+            torch.compile(kernel)(*dev_args)
+        return E2EResult(
+            result=None, reference=reference, max_abs_diff=math.inf, close=False
         )
+    result = torch.compile(kernel)(*dev_args).cpu()
 
     test.assertEqual(
         result.shape, reference.shape, "e2e run produced the wrong output shape"
@@ -463,20 +453,12 @@ def run_e2e(
 
     diff = torch.abs(reference.float() - result.float()).amax().item()
     close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
-
-    if expect_close is True:
+    if expect_close:
         test.assertTrue(
             close, f"e2e result must match the CPU reference (max abs diff {diff:.4g})"
         )
-    elif expect_close is False:
+    else:
         test.assertFalse(close, "e2e result unexpectedly matched the CPU reference")
-    elif not close:
-        pytest.xfail(
-            "e2e result diverges from the CPU reference "
-            f"(max abs diff {diff:.4g}); the Spyre backend does not yet "
-            "implement indirect access correctly. The pipeline compiled and "
-            "ran end-to-end."
-        )
     return E2EResult(result=result, reference=reference, max_abs_diff=diff, close=close)
 
 
@@ -500,7 +482,10 @@ def bundle_jsons_from_captured(captured) -> dict:
         sub = os.path.join(out, f"kernel{ci}")
         os.makedirs(sub, exist_ok=True)
         try:
-            generate_bundle(f"kernel{ci}", sub, specs)
+            # This call only inspects SDSC JSON structure, not hardware pool
+            # sizing, so a placeholder non-zero size satisfies generate_bundle's
+            # pool_size validation whenever a pool symbol happens to be present.
+            generate_bundle(f"kernel{ci}", sub, specs, pool_size=1024)
         except Exception:  # noqa: BLE001 - absence of jsons is itself an outcome
             continue
         for path in sorted(glob.glob(os.path.join(sub, "sdsc_*.json"))):
@@ -579,6 +564,75 @@ class IndirectAccessTestCase(InductorTestCase):
         torch.manual_seed(3)
         # Recompile from scratch so our sdsc spy always sees the op specs.
         torch._dynamo.reset()
+
+    # -- Work-division split-map assertion -------------------------------
+    # An int32 index packs 32 elements per 128-byte stick, so an index/entry dim
+    # of size `S` exposes `S // 32` sticks — the ceiling on how many cores
+    # can split it.
+    INDEX_ELEMS_PER_STICK = 32
+
+    def assert_indexed_dim_split(self, code, index_size, data_size):
+        """Assert the work-division split map at the current SENCORES.
+
+        For a gather `out = x[i]` or overwrite-scatter `dest[i] = src`, the
+        planner MUST split the index/entry dim (c0) and MUST NOT split the
+        value-table / destination data dim (c1). The entry dim is the index
+        tensor's stick dim, so it splits in whole 32-entry sticks: the split is
+        the planner's ``core_split`` -- the largest divisor of the stick count
+        that does not exceed SENCORES (so it always divides evenly, and a
+        non-power-of-two core count like 6 rounds down to the nearest divisor,
+        e.g. 8 sticks over 6 cores -> 4). c1 always stays 1. Skips at
+        sencores=1. Partial-stick entry counts use ``assert_entry_dim_unsplit``.
+
+        For power-of-two stick counts and core counts (the historical sweep)
+        ``core_split`` equals ``min(sencores, sticks)`` -- this generalises it to
+        the odd stick counts (6, 7, ...) and odd core counts the padded / 6-core
+        variants introduce.
+        """
+        from torch_spyre._inductor import config
+
+        n = config.sencores
+        if n == 1:
+            self.skipTest("no work division at sencores=1")
+        sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
+        expected = max(divisor for divisor in range(1, n + 1) if sticks % divisor == 0)
+        self.assertIn(
+            f"sympify('c0'): (sympify('{index_size}'), {expected})",
+            code,
+            f"index/entry dim {index_size} must split by {expected} at {n} cores "
+            f"(largest divisor of {sticks} sticks not exceeding {n})",
+        )
+        self.assertIn(
+            f"sympify('c1'): (sympify('{data_size}'), 1)",
+            code,
+            f"data dim {data_size} must stay unsplit (split=1) at {n} cores; "
+            "splitting a shared table/destination dim silently corrupts results",
+        )
+
+    def assert_entry_dim_unsplit(self, code, index_size, data_size=None):
+        """Assert the index/entry dim is NOT core-split at the current SENCORES.
+
+        A partial last stick is padded by restickify. That padded dimension must
+        stay on one core: older code enforced this only inside SuperDSC, after
+        wrapper emission, so the wrapper could advertise a split the device did
+        not execute. Planning now blocks that split before wrapper emission.
+        """
+        from torch_spyre._inductor import config
+
+        n = config.sencores
+        if n == 1:
+            self.skipTest("no work division at sencores=1")
+        self.assertIn(
+            f"sympify('c0'): (sympify('{index_size}'), 1)",
+            code,
+            f"partial-stick entry dim {index_size} must stay unsplit at {n} cores",
+        )
+        if data_size is not None:
+            self.assertIn(
+                f"sympify('c1'): (sympify('{data_size}'), 1)",
+                code,
+                f"data dim {data_size} must stay unsplit at {n} cores",
+            )
 
     # -- Dimension naming helpers ----------------------------------------
     def name_dims(self, tensor, dims: dict):
@@ -706,20 +760,43 @@ class IndirectAccessTestCase(InductorTestCase):
 
     # -- one driver: validate every stage, then run on the real backend ---
     def _stage_and_e2e(
-        self, kernel, *dev_args, expect, op=None, detected=None, expect_close=None
+        self,
+        kernel,
+        *dev_args,
+        expect,
+        op=None,
+        detected=None,
+        expect_close=True,
+        expect_backend_error=None,
+        sdsc=True,
     ):
         """Validate every capture-path stage with check(), then run end-to-end.
 
-        Shared by the gather and scatter op-family tests. Currently only the
-        capture-path stages run; the e2e leg (real backend: dxp_standalone +
-        on-device launch via run_e2e) is wired up but disabled until e2e
-        support lands. Pass expect_close=True for ops whose result must match
-        the CPU reference (e.g. a supported direct op) once e2e is enabled.
+        Shared by the gather and scatter op-family tests. The e2e leg (real
+        backend compiler + on-device launch via run_e2e) must match the CPU
+        reference. To pin a known backend gap pass ``expect_close=False``
+        (values diverge) or ``expect_backend_error`` (a regex the compile
+        failure must match); the stage checks above stay strict either way.
+
+        `sdsc=False` skips assert_indirect_sdsc_fields (still classifies the
+        op spec + runs e2e). Needed for a bundle that is simultaneously a gather
+        AND a scatter -- e.g. index_add's gather+add+overwrite-scatter
+        decomposition -- where the scatter-only invariant "every indirect value
+        tensor is the output" does not hold (the gather's value tensor is an
+        input).
 
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
-        r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
-        run_e2e(self, kernel, *dev_args, expect_close=expect_close)
+        r = self.check(
+            kernel, *dev_args, expect=expect, op=op, detected=detected, sdsc=sdsc
+        )
+        run_e2e(
+            self,
+            kernel,
+            *dev_args,
+            expect_close=expect_close,
+            expect_backend_error=expect_backend_error,
+        )
         return r
 
     # -- SDSC indirect-access field validation ---------------------------
@@ -920,3 +997,37 @@ class IndirectAccessTestCase(InductorTestCase):
 
         self.assertTrue(saw_index, "no index_tensor nodes anywhere in the SDSC bundle")
         self.assertTrue(saw_value, "no value_tensor nodes anywhere in the SDSC bundle")
+
+
+def register_multicore_variants(
+    scenario_mixin,
+    base_name: str,
+    module_globals: dict,
+    counts=MULTICORE_SENCORES,
+):
+    """Register one concrete TestCase per core count from a scenario mixin.
+
+    `scenario_mixin` is a plain class (NOT a TestCase, so neither pytest nor
+    unittest collects it directly) that holds the `test_*` methods and their
+    helpers. For each `n` in `counts` this builds
+    `{base_name}_cores{n}` = `@config.patch({"sencores": n})` applied to a
+    class combining the mixin with `IndirectAccessTestCase`, so the whole
+    scenario set runs at every SENCORES value. The classes are inserted into
+    `module_globals` (pass the caller's `globals()`) for test discovery.
+
+    Returns the list of generated class names.
+    """
+    from torch_spyre._inductor import config
+
+    module_name = module_globals.get("__name__", scenario_mixin.__module__)
+    names: list[str] = []
+    for n in counts:
+        name = f"{base_name}_cores{n}"
+        cls = config.patch({"sencores": n})(
+            type(name, (scenario_mixin, IndirectAccessTestCase), {})
+        )
+        cls.__module__ = module_name
+        cls.__qualname__ = name
+        module_globals[name] = cls
+        names.append(name)
+    return names

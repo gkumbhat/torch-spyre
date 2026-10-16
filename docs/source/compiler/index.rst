@@ -49,16 +49,23 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
 
    adding_operations
    indirect_access
+   indirect_access_work_division
 
 .. toctree::
    :maxdepth: 2
    :caption: Optimization passes
-   
+
    working_set_reduction
    coarse_tiling_loops
+   marker_resolution
+   layout_optimization
    cost_model
+   restickify_cost_model
    span_overflow_hint_analysis
    work_division_planning
    scratchpad_planning
+   co_optimizer
    simulated_annealing_layout
+   sa_co_optimization
+   native_packer_performance
    hbm_pool_planning

@@ -21,6 +21,8 @@
 #include <c10/core/Stream.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -28,11 +30,11 @@
 #include <utility>
 #include <vector>
 
-#include "flex/flex.hpp"
 #include "job_plan.h"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
@@ -71,6 +73,12 @@ struct StreamPool {
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
+
+  // Set to true once initializeStreamPoolImpl has been called.
+  bool initialized = false;
+  // Records the device_index passed to initializeStreamPoolImpl (valid only
+  // when initialized == true), used in error messages.
+  c10::DeviceIndex initialized_device_index = -1;
 };
 
 StreamPool& getStreamPool() {
@@ -139,8 +147,8 @@ int SpyreStream::priority() const {
 bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->query();
@@ -150,8 +158,8 @@ void SpyreStream::synchronize() const {
   RECORD_FUNCTION("host::synchronize", {});
   c10::DeviceGuard device_guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   resolveRuntimeHandle()->synchronize();
 }
@@ -164,13 +172,16 @@ void SpyreStream::copyProgramAsync(
     void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
   // NOTE: the assumption is that the size of the program match the size of
   // device_address
-  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
+  copyAsyncImpl(prog_cpu_ptr, /*cpu_storage_bytes=*/0, device_address, nullptr,
+                /*host2device=*/true);
 }
 
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
-  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+  SPYRE_RUNTIME_DEBUG() << "src (" << src.scalar_type()
+                        << ") is on:" << src.device();
+  SPYRE_RUNTIME_DEBUG() << "dst (" << dst.scalar_type()
+                        << ") on:" << dst.device();
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
@@ -182,20 +193,16 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   if (host2device || device2host) {
     // Host-to-device or device-to-host copy
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
+    const size_t cpu_storage_bytes = cpu_tensor->storage().nbytes();
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    // Extract device allocation from Spyre tensor storage
-    auto* spyre_impl =
-        static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
-    auto& storage = spyre_impl->storage();
-    auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
+    DataConversionInfo dci =
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
-
-    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+    copyAsyncImpl(cpu_ptr, cpu_storage_bytes,
+                  get_composite_address(*dev_tensor), &dci, host2device);
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -219,7 +226,7 @@ SpyreStreamError SpyreStream::getError() const {
                                                  : SpyreStreamError::Success;
 }
 
-void SpyreStream::copyAsyncImpl(void* cpu_ptr,
+void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
                                 const flex::CompositeAddress* device_address,
                                 const DataConversionInfo* dci,
                                 bool host2device) const {
@@ -234,61 +241,139 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
     launchH2D(params);
     flex::destroyDmaParams(params);
   } else {
+    // Pass the true host buffer capacity so flex can give ConvertData the
+    // correct out_capacity_bytes for dtype-upscaling D2H transfers (e.g.
+    // bf16→fp32), where the host buffer is larger than the device staging
+    // buffer.
     auto* params =
         flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
+                              host2device, device_address, std::move(dci_ptr),
+                              /*iova=*/nullptr, /*use_compute_pipeline=*/false,
+                              /*pipeline_barrier=*/false, /*skip_hazard=*/false,
+                              /*host_capacity_bytes=*/cpu_storage_bytes);
     launchD2H(params);
     flex::destroyDmaParams(params);
   }
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::H2D))
+      << "launchH2D called with params tagged as D2H — check createDmaParams' "
+         "to_device argument";
   RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->launchOperationH2D(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::D2H))
+      << "launchD2H called with params tagged as H2D — check createDmaParams' "
+         "to_device argument";
   RECORD_FUNCTION("launch::D2H", {});
-  resolveRuntimeHandle()->launchOperationD2H(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
   RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launchOperationCompute(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   RECORD_FUNCTION("launch::HostCallback", {});
-  resolveRuntimeHandle()->launchOperationHostCallback(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
-void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
-                            DataFormats dtype, bool use_dmai) const {
+void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   RECORD_FUNCTION("launch::Memset", {});
-  resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+  resolveRuntimeHandle()->launchOperation(params);
+}
+
+flex::HostComputeBuffer* SpyreStream::launchHostCompute(
+    flex::HostComputeParams* params) const {
+  RECORD_FUNCTION("launch::HostCompute", {});
+  return resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
-                         const std::vector<at::Tensor>& args) const {
+                         const std::vector<at::Tensor>& args,
+                         std::vector<SymbolicArg> symbolic_args) const {
   // Validate all tensors are on Spyre device
   for (size_t i = 0; i < args.size(); ++i) {
     TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  // Create launch context with tensor arguments
-  LaunchContext ctx{args};
+  // Two-stream overlap topology:
+  //   S_dev  = this stream (the default) — Compute (+ D2H).
+  //   S_prep = the persistent host-compute stream — HostCompute + separate H2D.
+  // Batched correction uploads instead travel with their compute on S_dev.
+  // HostCompute runs inline on the caller; only uploads and compute are queued.
+  // S_dev compute can overlap preparation for subsequent launches. Every op
+  // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
+  // persistent flex handle each launch: getHostComputeStreamById is a pure
+  // lookup of the handle registered once in initializeStreamPoolImpl.
+  const SpyreStream& s_dev = *this;
+  const SpyreStream s_prep =
+      getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
 
-  // Each JobPlanStep builds its flex operation params and launches them on
-  // this stream in order. flex owns the RuntimeOperation lifecycle.
-  for (const auto& step : plan.steps) {
-    step->construct(ctx, *this);
+  // Create launch context with tensor arguments and typed symbolic payload.
+  // symbolic_args is moved in so the closure in
+  // JobPlanStepHostCompute::construct can capture it by value without an extra
+  // copy.
+  LaunchContext ctx{args, std::move(symbolic_args)};
+  const size_t max_corrections =
+      s_dev.resolveRuntimeHandle()->maxProgramCorrections();
+
+  // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
+  // then inserts the cross-stream edges. Off = every step on S_dev (the
+  // single-stream floor). Routing keys on role(), so all-Dev plans never split.
+  // This switch controls stream splitting only: eligible correction batching is
+  // enabled in both topologies, including the single-stream path.
+  const bool should_split = get_hazard_tracker_enabled();
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    const auto& step = plan.steps[i];
+    const auto kind = classifyStep(*step);
+    // Group by operation kind: Prep also includes standalone H2D steps, which
+    // must not be collected as host corrections. Pin the role assumptions used
+    // by the routing below so new step variants cannot silently change them.
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(kind != StepKind::HostCompute ||
+                                     step->role() == StreamRole::Prep);
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(kind != StepKind::Compute ||
+                                     step->role() == StreamRole::Dev);
+    if (max_corrections > 0 && kind == StepKind::HostCompute &&
+        (i == 0 || classifyStep(*plan.steps[i - 1]) != StepKind::HostCompute)) {
+      size_t end = i + 1;
+      while (end < plan.steps.size() &&
+             classifyStep(*plan.steps[end]) == StepKind::HostCompute) {
+        ++end;
+      }
+      // Flex reports the supported correction count for the consuming stream.
+      // Keep the whole group on separate uploads when it cannot be batched.
+      ctx.batch_program_corrections =
+          end - i <= max_corrections && end < plan.steps.size() &&
+          classifyStep(*plan.steps[end]) == StepKind::Compute;
+    }
+    const SpyreStream& target =
+        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+    step->construct(ctx, target);
   }
+  TORCH_CHECK(ctx.program_corrections.empty(),
+              "Program correction has no consuming compute step");
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::unique_lock<std::shared_mutex> lock(pool.mutex);
+
+  // Check that this is the first and only device initialization
+  TORCH_CHECK(!pool.initialized,
+              "initializeStreamPoolImpl already called with device_index ",
+              static_cast<int>(pool.initialized_device_index),
+              "; cannot reinitialize with device_index ",
+              static_cast<int>(device_index));
+  pool.initialized = true;
+  pool.initialized_device_index = device_index;
 
   // Initialize mapping from StreamId → RuntimeStream*.
   // RuntimeStream instances are owned by GlobalRuntime.
@@ -311,9 +396,11 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         pool.stream_handle_map.find(sid) == pool.stream_handle_map.end(),
         "Host compute stream id ", sid,
         " is already registered; only one Spyre device per process is "
-        "supported");
+        "supported.");
     pool.stream_handle_map[sid] =
-        runtime->createStream(flex::RuntimeStreamPriority::NORMAL);
+        runtime->createStream(flex::RuntimeStreamPriority::NORMAL,
+                              flex::RuntimeStreamMode::STRICT_ORDERING,
+                              /*track_hazards=*/get_hazard_tracker_enabled());
     pool.host_compute_streams[device_index].push_back(sid);
   }
   pool.next_host_compute_idx[device_index] = 0;
@@ -464,7 +551,9 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     flex::RuntimeStreamPriority streamPriority =
         priority < 0 ? flex::RuntimeStreamPriority::HIGH
                      : flex::RuntimeStreamPriority::NORMAL;
-    flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
+    flex::RuntimeStream* flex_handle = runtime->createStream(
+        streamPriority, flex::RuntimeStreamMode::STRICT_ORDERING,
+        /*track_hazards=*/get_hazard_tracker_enabled());
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
@@ -504,7 +593,6 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       collect(pool.host_compute_streams);
     }  // lock released
 
-    auto runtime = GlobalRuntime::get();
     c10::DeviceGuard guard(dev);
     for (auto handle : handles_to_sync) {
       handle->synchronize();

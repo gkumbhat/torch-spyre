@@ -15,7 +15,7 @@ common Torch-Spyre use cases.
 | `mean.py` | Computing mean reduction on Spyre |
 | `mul.py` | Element-wise multiplication on Spyre |
 | `softplus.py` | Computing softplus activation on Spyre |
-| `spyre_hints.py` | Using Spyre compiler hints to control tiling |
+| `for_each_tile.py` | Tiling a computation into a loop with `for_each_tile` (a map over M, a split-K carry) |
 | `profile_ops.py` | Measuring one operation's device time with the PyTorch profiler (see [the cost model](../../compiler/cost_model.md)) |
 | `run_cost_model_sweep.py` | Re-measuring every configuration in the cost-model database |
 
@@ -29,7 +29,10 @@ common Torch-Spyre use cases.
 | `distributed/broadcast.py` | Broadcast collective on Spyre |
 | `distributed/gather.py` | Gather collective on Spyre |
 | `distributed/reduce.py` | Reduce collective on Spyre |
-| `broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+| `distributed/compiled/broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+| `distributed/compiled/all_gather_demo_multirank.py` | Multi-rank all-gather walkthrough |
+| `distributed/compiled/all_reduce_demo_multirank.py` | Multi-rank allreduce via `torch.compile`'s plan/run collective ops |
+| `distributed/compiled/all_reduce_demo_multicalls_multirank.py` | Multi-rank allreduce with multiple compiled calls sharing one plan |
 
 ## Scratchpad Planning Examples
 

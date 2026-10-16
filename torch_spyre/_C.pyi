@@ -15,6 +15,8 @@ __all__: list[str] = [
     "SpyreStreamError",
     "SpyreDeviceState",
     "SpyreTensorLayout",
+    "SymbolicArg",
+    "SymbolicArgKind",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
@@ -35,6 +37,7 @@ __all__: list[str] = [
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "get_device_size_in_bytes",
     "kernel_provenance_registry_stats",
     "launch_jobplan",
     "lookup_kernel_provenance",
@@ -201,6 +204,16 @@ class SpyreTensorLayout:
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+        valid_elements: dict[tuple[int, ...], int] = {},
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        device_size: collections.abc.Sequence[typing.SupportsInt],
+        stride_map: collections.abc.Sequence[typing.SupportsInt],
+        device_dtype: DataFormats,
+        valid_elements: dict[tuple[int, ...], int],
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
@@ -216,6 +229,8 @@ class SpyreTensorLayout:
     def element_arrangement(self) -> ElementArrangement: ...
     @property
     def stride_map(self) -> list[int]: ...
+    @property
+    def valid_elements(self) -> dict[tuple[int, ...], int]: ...
 
 class _SpyreStreamBase:
     """
@@ -345,7 +360,49 @@ def get_downcast_warning() -> bool:
     """
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
+@typing.overload
+def get_device_size_in_bytes(layout: SpyreTensorLayout) -> int: ...
+@typing.overload
+def get_device_size_in_bytes(
+    device_size: typing.Sequence[int], device_dtype: DataFormats
+) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
+
+class SymbolicArgKind:
+    """
+    Members:
+
+      kAddress
+
+      kDimension
+    """
+
+    kAddress: typing.ClassVar[SymbolicArgKind]
+    kDimension: typing.ClassVar[SymbolicArgKind]
+    __members__: typing.ClassVar[dict[str, SymbolicArgKind]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __init__(self, value: typing.SupportsInt) -> None: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+class SymbolicArg:
+    kind: SymbolicArgKind
+    value: int
+    tensor_id: int
+    dim_index: int
+    def __init__(
+        self,
+        kind: SymbolicArgKind,
+        tensor_id: int,
+        dim_index: int = -1,
+        value: int = -1,
+    ) -> None: ...
+    def __repr__(self) -> str: ...
 
 class JobPlan:
     """
@@ -370,7 +427,9 @@ class JobPlan:
         ...
 
 def launch_jobplan(
-    job_plan: JobPlan, args: collections.abc.Sequence[torch.Tensor]
+    job_plan: JobPlan,
+    args: collections.abc.Sequence[torch.Tensor],
+    symbolic_args: list[SymbolicArg] = ...,
 ) -> None:
     """
     Launch a prepared JobPlan with the given tensor arguments.
@@ -378,6 +437,7 @@ def launch_jobplan(
     Args:
         job_plan: The JobPlan to execute
         args: Sequence of input/output tensors
+        symbolic_args: Optional typed per-symbol payload. Defaults to empty.
     """
     ...
 
@@ -408,10 +468,11 @@ def set_downcast_warning(arg0: bool) -> None:
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
 def spyre_empty_with_layout(
-    arg0: tuple[int, ...],
-    arg1: tuple[int, ...],
-    arg2: torch.dtype,
-    arg3: SpyreTensorLayout,
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    device_layout: SpyreTensorLayout,
+    device: torch.device | None = None,
 ) -> torch.Tensor: ...
 
 class SpyreStreamError:

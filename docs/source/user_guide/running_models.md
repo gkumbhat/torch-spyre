@@ -3,6 +3,11 @@
 This page explains how to run full PyTorch models on the Spyre device
 using `torch.compile` and the Torch-Spyre backend.
 
+To run a stock HuggingFace Transformers checkpoint without writing your own
+model code, see [Running HuggingFace models on Spyre](running_hf_models.md),
+which covers the [hf-adapters](https://github.com/torch-spyre/hf-adapters)
+project.
+
 ## Using `torch.compile`
 
 Torch-Spyre registers itself as an Inductor backend for the `spyre`
@@ -45,7 +50,7 @@ Valid values: 1–32 (default: 32). See
 
 Full working examples are listed on the [Examples](examples/index.md)
 page. It has single-op scripts (`tensor_allocate.py`, `softmax.py`,
-`gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `spyre_hints.py`), a
+`gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `for_each_tile.py`), a
 `distributed/` set covering the collective ops (allgather, allreduce,
 broadcast, gather, reduce, barrier) plus a multi-rank broadcast
 walkthrough, and a `scratchpad/` set that models the LX layout solver in

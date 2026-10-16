@@ -24,10 +24,7 @@ from unittest import TestCase
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
-from torch_spyre._inductor.scratchpad.permutation_layout import (
-    PermutationBasedLayoutSolver,
-    buffer_quality,
-)
+from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
     ExponentialCoolingSchedule,
@@ -37,6 +34,8 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
+
+from tests.inductor.reference_perm_layout import buffer_quality
 
 # Heavy randomized anneals over many seeds, larger problems and longer
 # schedules. Skipped by default (slow); opt in with the env var.
@@ -58,7 +57,7 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
             child = buffers[child_i]
             if parent.read_count == 0:
                 # A write-only parent has nothing to hand over, so the pair is
-                # not expressible at all (see ``assert_in_place_parent_is_read``).
+                # not expressible at all (see ``check_in_place_parent_is_read``).
                 # Drawing one is possible because a base buffer may land on a
                 # single-tick lifetime; skip rather than reshaping the parent,
                 # which could invalidate a pair already wired to it.
@@ -383,7 +382,7 @@ class SimulatedAnnealingTests(TestCase):
             cap = max(b.size for b in buffers) * rng.randint(2, 4)
             initial = list(range(n))
             rng.shuffle(initial)
-            initial_quality = PermutationBasedLayoutSolver(
+            initial_quality = NativePermutationLayoutSolver(
                 copy.deepcopy(buffers), list(initial), cap, 128
             ).quality()
 
@@ -412,7 +411,7 @@ class SimulatedAnnealingTests(TestCase):
             cap = max(b.size for b in buffers) * rng.randint(2, 4)
             initial = list(range(n))
             rng.shuffle(initial)
-            initial_quality = PermutationBasedLayoutSolver(
+            initial_quality = NativePermutationLayoutSolver(
                 copy.deepcopy(buffers), list(initial), cap, 128
             ).quality()
 
@@ -448,7 +447,7 @@ class SimulatedAnnealingStressTests(TestCase):
             cap = max(b.size for b in buffers) * rng.randint(2, 5)
             initial = list(range(n))
             rng.shuffle(initial)
-            initial_quality = PermutationBasedLayoutSolver(
+            initial_quality = NativePermutationLayoutSolver(
                 copy.deepcopy(buffers), list(initial), cap, 128
             ).quality()
 

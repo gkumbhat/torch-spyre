@@ -6,6 +6,8 @@ Shared class and methods for all OOT PyTorch test overrides.
 
 import os
 import json
+import unittest
+from functools import wraps
 from typing import Dict, List, Optional, Set, Tuple
 import warnings
 
@@ -58,6 +60,7 @@ from oot_framework.oot_test_config_models import (
     TestEntry,
 )
 from oot_framework.oot_test_common_methods_invocations import (
+    _make_named_module_info_cls,
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
@@ -79,6 +82,7 @@ warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 # torch._C._get_privateuse1_backend_name() returns e.g. "spyre".
 # This is what slf.device_type will be at test runtime.
 _OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
+assert _OOT_DEVICE_TYPE != "privateuse1"
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +126,7 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     See oot_test_config_schema.json for the full schema.
     """
 
-    device_type: str = "privateuse1"
+    device_type: str = _OOT_DEVICE_TYPE
     precision: float = DEFAULT_FLOATING_PRECISION
 
     # Exact-name lookup map: {base_method_name -> [TestEntry, ...]}
@@ -152,18 +156,6 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
     _FILE_LEVEL_EXCLUDED_MODULES: Optional[Set[str]] = None
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        # PrivateUse1TestBase.setUpClass sets cls.device_type to the registered
-        # backend name (e.g. "spyre").  This mutates the base class's device_type,
-        # causing subsequent instantiate_device_type_tests calls to generate class
-        # names like TestOldViewOpsSPYRE instead of TestOldViewOpsPRIVATEUSE1,
-        # which then get filtered out by PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
-        # Reset OOTTestBase.device_type to "privateuse1" so subsequent
-        # calls generate the correct class name.
-        OOTTestBase.device_type = "privateuse1"
 
     @classmethod
     def get_all_devices(cls):
@@ -282,6 +274,11 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             )
             return
 
+        # The YAML's `name` has to win over the class-derived one so several
+        # entries for the same class (one per layer, per phase, ...) each get a
+        # distinct test name instead of colliding.
+        named_module_info_cls = _make_named_module_info_cls(ModuleInfo)
+
         # Get existing module names to avoid duplicates
         existing_names = {m.name for m in module_db}
         for i, module_item in enumerate(modules_named_items):
@@ -339,12 +336,13 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                     if resolved_dtypes
                     else (torch.float32, torch.float16, torch.bfloat16)
                 )
-                module_info = ModuleInfo(
+                module_info = named_module_info_cls(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
                     dtypes=dtypes,
+                    oot_name=module_name,
                 )
                 # ModuleInfo has no field for this, and upstream never looks at
                 # it; attach it so device-specific tests can read the YAML's
@@ -786,8 +784,26 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 # SKIPPED lines per test.
                 #
                 # Deleting the method entirely removes it from the class so
-                # pytest never collects it
-                delattr(cls, method_name)
+                # pytest never collects it -- EXCEPT when method_name is
+                # identical to the untouched, undecorated method still sitting
+                # on generic_cls's own __dict__ (true for any test with no
+                # dtype/device suffix, e.g. a plain method with no @dtypes/
+                # @ops parametrization). `cls` is built as
+                # type(class_name, (base, generic_cls), {}), so delattr only
+                # removes cls's own override and unmasks the inherited
+                # original, which then runs unfiltered (see issue: YAML
+                # mode:skip silently ignored, tests reaching hardcoded
+                # GPU_TYPE/cuda calls). Fall back to a skip stub in that case.
+                if generic_cls is not None and method_name in generic_cls.__dict__:
+                    _skip_reason = reason or "Skipped by OOT config"
+
+                    @wraps(test)
+                    def _skip(self, _reason=_skip_reason):
+                        raise unittest.SkipTest(_reason)
+
+                    setattr(cls, method_name, _skip)
+                else:
+                    delattr(cls, method_name)
                 continue
 
             # Following lines has been commented out to disable generating
@@ -920,7 +936,8 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         if _tags_to_write:
             _cfg = os.environ.get(ENV_TEST_CONFIG, "")
             if _cfg:
-                _sidecar = _cfg + ".markers.json"
+                # Per process: xdist workers and card-parallel shards write concurrently.
+                _sidecar = f"{_cfg}.markers.{os.getpid()}.json"
                 _existing_tags: dict = {}
                 try:
                     with open(_sidecar) as _sf:
